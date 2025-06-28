@@ -92,3 +92,99 @@
         status: (string-utf8 20)
     }
 )
+
+
+;; Read-only functions
+(define-read-only (get-pool (pool-id uint))
+    (map-get? pools { pool-id: pool-id })
+)
+
+(define-read-only (get-contribution (pool-id uint) (contributor principal))
+    (map-get? contributions { pool-id: pool-id, contributor: contributor })
+)
+
+(define-read-only (get-proposal (pool-id uint) (proposal-id uint))
+    (map-get? proposals { pool-id: pool-id, proposal-id: proposal-id })
+)
+
+(define-read-only (get-vote (pool-id uint) (proposal-id uint) (voter principal))
+    (map-get? votes { pool-id: pool-id, proposal-id: proposal-id, voter: voter })
+)
+
+;; Create new pool
+(define-public (create-pool)
+    (let
+        ((new-pool-id (+ (var-get pool-counter) u1)))
+        (map-set pools
+            { pool-id: new-pool-id }
+            {
+                total-funds: u0,
+                active: true,
+                creator: tx-sender,
+                created-at: stacks-block-height
+            }
+        )
+        (var-set pool-counter new-pool-id)
+        (ok new-pool-id)
+    )
+)
+
+;; Contribute to pool
+(define-public (contribute (pool-id uint) (amount uint))
+    (let
+        ((pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND))
+         (current-contribution (default-to { amount: u0 }
+            (get-contribution pool-id tx-sender))))
+
+        ;; Checks
+        (asserts! (>= amount MIN_CONTRIBUTION) ERR_INVALID_AMOUNT)
+        (asserts! (get active pool) ERR_POOL_NOT_FOUND)
+
+        ;; Transfer STX to contract
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+        ;; Update pool and contribution records
+        (map-set pools
+            { pool-id: pool-id }
+            (merge pool { total-funds: (+ (get total-funds pool) amount) })
+        )
+        (map-set contributions
+            { pool-id: pool-id, contributor: tx-sender }
+            { amount: (+ amount (get amount current-contribution)) }
+        )
+        (ok true)
+    )
+)
+
+;; Submit proposal
+(define-public (submit-proposal 
+    (pool-id uint)
+    (startup principal)
+    (amount uint)
+    (description (string-utf8 256)))
+
+    (let
+        ((pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND))
+         (new-proposal-id (+ (var-get proposal-counter) u1)))
+
+        ;; Checks
+        (asserts! (>= (get total-funds pool) PROPOSAL_THRESHOLD) ERR_BELOW_THRESHOLD)
+        (asserts! (<= amount (get total-funds pool)) ERR_INSUFFICIENT_FUNDS)
+
+        ;; Create proposal
+        (map-set proposals
+            { pool-id: pool-id, proposal-id: new-proposal-id }
+            {
+                startup: startup,
+                amount: amount,
+                description: description,
+                votes-for: u0,
+                votes-against: u0,
+                status: u"active",
+                created-at: stacks-block-height
+            }
+        )
+        (var-set proposal-counter new-proposal-id)
+        (ok new-proposal-id)
+    )
+)
