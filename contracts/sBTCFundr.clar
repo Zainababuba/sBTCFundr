@@ -188,3 +188,175 @@
         (ok new-proposal-id)
     )
 )
+
+
+;; Vote on proposal
+(define-public (vote (pool-id uint) (proposal-id uint) (vote-for bool))
+    (let
+        ((proposal (unwrap! (get-proposal pool-id proposal-id) ERR_POOL_NOT_FOUND))
+         (contribution (unwrap! (get-contribution pool-id tx-sender) ERR_NOT_AUTHORIZED))
+         (voting-power (get amount contribution)))
+
+        ;; Checks
+        (asserts! (is-eq (get status proposal) u"active") ERR_VOTING_CLOSED)
+        (asserts! (is-none (get-vote pool-id proposal-id tx-sender)) ERR_ALREADY_VOTED)
+
+        ;; Record vote
+        (map-set votes
+            { pool-id: pool-id, proposal-id: proposal-id, voter: tx-sender }
+            { vote: vote-for }
+        )
+
+        ;; Update proposal votes
+        (map-set proposals
+            { pool-id: pool-id, proposal-id: proposal-id }
+            (merge proposal {
+                votes-for: (if vote-for 
+                    (+ (get votes-for proposal) voting-power)
+                    (get votes-for proposal)),
+                votes-against: (if vote-for
+                    (get votes-against proposal)
+                    (+ (get votes-against proposal) voting-power))
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Execute proposal
+(define-public (execute-proposal (pool-id uint) (proposal-id uint))
+    (let
+        ((proposal (unwrap! (get-proposal pool-id proposal-id) ERR_POOL_NOT_FOUND))
+         (pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND)))
+
+        ;; Checks
+        (asserts! (is-eq (get status proposal) u"active") ERR_VOTING_CLOSED)
+        (asserts! (>= (- stacks-block-height (get created-at proposal)) VOTING_PERIOD) ERR_VOTING_CLOSED)
+
+        ;; Check if proposal passed
+        (if (> (get votes-for proposal) (get votes-against proposal))
+            (begin
+                ;; Transfer funds to startup
+                (try! (as-contract (stx-transfer? 
+                    (get amount proposal)
+                    (as-contract tx-sender)
+                    (get startup proposal))))
+
+                ;; Update proposal status
+                (map-set proposals
+                    { pool-id: pool-id, proposal-id: proposal-id }
+                    (merge proposal { status: u"executed" })
+                )
+                (ok true)
+            )
+            (begin
+                ;; Update proposal status
+                (map-set proposals
+                    { pool-id: pool-id, proposal-id: proposal-id }
+                    (merge proposal { status: u"rejected" })
+                )
+                (ok false)
+            )
+        )
+    )
+)
+
+;; Set pool metadata
+(define-public (set-pool-metadata 
+    (pool-id uint)
+    (name (string-utf8 64))
+    (description (string-utf8 256))
+    (category (string-utf8 64))
+    (logo-uri (string-utf8 256)))
+
+    (let
+        ((pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND)))
+
+        ;; Check if caller is the pool creator
+        (asserts! (is-eq tx-sender (get creator pool)) ERR_NOT_AUTHORIZED)
+
+        ;; Validate inputs
+        (asserts! (> (len name) u0) ERR_INVALID_METADATA)
+        (asserts! (> (len description) u0) ERR_INVALID_METADATA)
+
+        ;; Set metadata
+        (ok (map-set pool-metadata
+            { pool-id: pool-id }
+            {
+                name: name,
+                description: description,
+                category: category,
+                logo-uri: logo-uri
+            }
+        ))
+    )
+)
+
+;; Get pool metadata
+(define-read-only (get-pool-metadata (pool-id uint))
+    (map-get? pool-metadata { pool-id: pool-id })
+)
+
+;; Search pools by category
+(define-read-only (get-pools-by-category (category (string-utf8 64)) (limit uint))
+    (ok u"Implementation would require off-chain indexing")
+)
+
+;; FEATURE 2: Staking & Rewards System
+
+;; Set reward rate (only contract owner)
+(define-public (set-reward-rate (new-rate uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (ok (var-set reward-rate new-rate))
+    )
+)
+
+;; Stake contribution in a pool
+(define-public (stake-contribution (pool-id uint) (amount uint))
+    (let
+        ((pool (unwrap! (get-pool pool-id) ERR_POOL_NOT_FOUND))
+         (contribution (unwrap! (get-contribution pool-id tx-sender) ERR_NOT_AUTHORIZED))
+         (existing-stake (get-staking-info pool-id tx-sender)))
+
+        ;; Checks
+        (asserts! (get active pool) ERR_POOL_NOT_FOUND)
+        (asserts! (<= amount (get amount contribution)) ERR_INSUFFICIENT_FUNDS)
+        (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+
+        ;; If already staking, claim rewards first
+        (if (is-some existing-stake)
+            (try! (claim-staking-rewards pool-id))
+            true)
+
+        ;; Set or update staking info
+        (ok (map-set staking-info
+            { pool-id: pool-id, staker: tx-sender }
+            {
+                staked-amount: (+ (default-to u0 (get staked-amount existing-stake)) amount),
+                staked-at: stacks-block-height,
+                last-reward-claim: stacks-block-height
+            }
+        ))
+    )
+)
+
+;; Get staking information
+(define-read-only (get-staking-info (pool-id uint) (staker principal))
+    (map-get? staking-info { pool-id: pool-id, staker: staker })
+)
+
+;; Calculate pending rewards
+(define-read-only (get-pending-rewards (pool-id uint))
+    (let
+        ((stake-data (unwrap! (get-staking-info pool-id tx-sender) ERR_STAKE_NOT_FOUND)))
+
+        (let
+            ((blocks-staked (- stacks-block-height (get last-reward-claim stake-data)))
+             (staked-amount (get staked-amount stake-data))
+             (base-reward (* blocks-staked (var-get reward-rate))))
+
+            (ok (* base-reward staked-amount))
+        )
+    )
+)
